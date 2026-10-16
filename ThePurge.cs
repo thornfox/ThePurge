@@ -9,8 +9,8 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("The Purge", "ThornFox", "1.2.1")]
-    [Description("Announces and manages a purge event with UI, optional timer, RealPVE integration (unload or PvP API), Notify support and configurable start/end commands.")]
+    [Info("The Purge", "ThornFox", "1.2.2")]
+    [Description("Announces and manages a purge event with UI, optional timer, optional RealPVE integration (auto, unload or PvP API), Notify support and configurable start/end commands.")]
     public class ThePurge : RustPlugin
     {
         #region Fields
@@ -39,12 +39,14 @@ namespace Oxide.Plugins
         // Hooks that are only needed while a purge is running.
         private static readonly string[] PurgeHooks = { "OnEntitySpawned", "OnPlayerConnected", "OnPlayerRespawned" };
 
-        private enum RealPveMode { Unload, Hooks, Off }
+        // Auto = Unload if RealPVE is installed, otherwise Off (RealPVE is optional).
+        private enum RealPveMode { Auto, Unload, Hooks, Off }
 
         private ConfigData config;
         private StoredData data;
         private Timer purgeTimer;
-        private RealPveMode realPveMode = RealPveMode.Unload;
+        private RealPveMode configuredMode = RealPveMode.Auto; // value from the config
+        private RealPveMode realPveMode = RealPveMode.Off;     // effective mode of the current purge
         private bool legacyActiveFlag;
         private bool pvpApplied;
         private bool markerCreated;
@@ -67,6 +69,9 @@ namespace Oxide.Plugins
             if (legacyActiveFlag && !data.IsActive)
             {
                 data.IsActive = true;
+                // 1.1.0 always unloaded the configured plugins (RealPVE included).
+                if (configuredMode == RealPveMode.Auto) SetEffectiveMode(RealPveMode.Unload);
+                else SetEffectiveMode(configuredMode);
                 foreach (var name in GetPluginsToStop())
                 {
                     if (FindPlugin(name) == null && !data.StoppedPlugins.Contains(name))
@@ -75,6 +80,9 @@ namespace Oxide.Plugins
                 SaveData();
                 PrintWarning("Active purge from version 1.1.0 detected and taken over.");
             }
+
+            // Restore the mode early so plugins loading before OnServerInitialized are handled correctly.
+            if (data.IsActive) RestoreEffectiveMode();
 
             UnsubscribePurgeHooks();
         }
@@ -96,6 +104,7 @@ namespace Oxide.Plugins
             }
 
             Puts("Resuming active purge.");
+            RestoreEffectiveMode();
             ApplyEffects();
             ScheduleEndTimer();
         }
@@ -109,6 +118,7 @@ namespace Oxide.Plugins
             data.EndUtcTicks = 0;
             data.InitiatorId = null;
             data.StoppedPlugins.Clear(); // all plugins load normally on server start
+            data.EffectiveMode = null;
             RestoreServerPve();
             SaveData();
         }
@@ -181,6 +191,15 @@ namespace Oxide.Plugins
             if (plugin == null || plugin == this || data == null || !data.IsActive) return;
 
             var name = plugin.Name;
+
+            // Auto mode: RealPVE was not installed when the purge started, but is loaded now.
+            // Switch to Unload so RealPVE cannot block the running purge.
+            if (configuredMode == RealPveMode.Auto && realPveMode == RealPveMode.Off && IsRealPve(name))
+            {
+                PrintWarning("RealPVE was loaded during an active purge. Switching to 'Unload' for this purge.");
+                SetEffectiveMode(RealPveMode.Unload);
+                RememberServerPve();
+            }
 
             if (GetPluginsToStop().Any(n => n.Equals(name, StringComparison.OrdinalIgnoreCase)))
             {
@@ -292,6 +311,7 @@ namespace Oxide.Plugins
             data.IsActive = true;
             data.InitiatorId = initiator?.UserIDString;
             data.EndUtcTicks = minutes > 0 ? DateTime.UtcNow.AddMinutes(minutes).Ticks : 0;
+            SetEffectiveMode(ResolveMode());
             SaveData();
 
             ApplyEffects();
@@ -322,6 +342,9 @@ namespace Oxide.Plugins
             purgeTimer = null;
 
             RevertEffects();
+
+            data.EffectiveMode = null;
+            SaveData();
 
             Broadcast("Ended", 2);
 
@@ -355,6 +378,47 @@ namespace Oxide.Plugins
                     CreateMapMarker();
                     break;
             }
+        }
+
+        // Decides how RealPVE is handled for a new purge. RealPVE is optional:
+        // in Auto mode nothing RealPVE-related is touched when it is not installed.
+        private RealPveMode ResolveMode()
+        {
+            if (configuredMode != RealPveMode.Auto) return configuredMode;
+
+            if (FindPlugin(RealPveName) != null)
+            {
+                Puts("RealPVE detected. Mode 'Auto' resolved to 'Unload'.");
+                return RealPveMode.Unload;
+            }
+
+            Puts("RealPVE not installed. Mode 'Auto' resolved to 'Off' (server.pve is not changed).");
+            return RealPveMode.Off;
+        }
+
+        private void SetEffectiveMode(RealPveMode mode)
+        {
+            realPveMode = mode == RealPveMode.Auto ? RealPveMode.Off : mode;
+            data.EffectiveMode = realPveMode.ToString();
+        }
+
+        // Uses the mode the running purge was started with, so a resume behaves the same way.
+        private void RestoreEffectiveMode()
+        {
+            RealPveMode stored;
+            if (!string.IsNullOrEmpty(data.EffectiveMode) && Enum.TryParse(data.EffectiveMode, true, out stored) && stored != RealPveMode.Auto)
+            {
+                realPveMode = stored;
+                return;
+            }
+
+            // Purge from an older version without a stored mode: RealPVE stopped by us means Unload.
+            var mode = configuredMode;
+            if (mode == RealPveMode.Auto)
+                mode = data.StoppedPlugins.Any(IsRealPve) || FindPlugin(RealPveName) != null ? RealPveMode.Unload : RealPveMode.Off;
+
+            SetEffectiveMode(mode);
+            SaveData();
         }
 
         private void RevertEffects()
@@ -760,10 +824,12 @@ namespace Oxide.Plugins
             public List<string> PurgeInformation { get; set; } = new List<string>();
             public List<string> PluginsToStop { get; set; } = new List<string>();
 
+            // RealPVE is optional.
+            // Auto   = Unload if RealPVE is installed, otherwise Off (default)
             // Unload = RealPVE is unloaded (all rules off, incl. raiding)
             // Hooks  = RealPVE stays loaded, players are switched to PvP via the RealPVE API
-            // Off    = RealPVE is not touched
-            public string RealPveMode { get; set; } = "Unload";
+            // Off    = RealPVE and server.pve are not touched
+            public string RealPveMode { get; set; } = "Auto";
             public bool DisableServerPveDuringPurge { get; set; } = true;
             public bool HooksIncludeSleepers { get; set; } = true;
             public bool HooksMakeCorpsesLootable { get; set; } = true;
@@ -784,7 +850,7 @@ namespace Oxide.Plugins
                 ConsoleCommandsOnStart = ConsoleCommandsOnStart ?? new List<string>();
                 ChatCommandsOnEnd = ChatCommandsOnEnd ?? new List<string>();
                 ConsoleCommandsOnEnd = ConsoleCommandsOnEnd ?? new List<string>();
-                if (string.IsNullOrWhiteSpace(RealPveMode)) RealPveMode = "Unload";
+                if (string.IsNullOrWhiteSpace(RealPveMode)) RealPveMode = "Auto";
                 if (string.IsNullOrWhiteSpace(HooksMapMarkerName)) HooksMapMarkerName = "PURGE";
                 if (HooksPvpDelayOnEnd < 0f) HooksPvpDelayOnEnd = 0f;
             }
@@ -848,16 +914,25 @@ namespace Oxide.Plugins
                 config.ConsoleCommandsOnEnd.Add(oldDefault);
             }
 
+            // Up to 1.2.1 the default was "Unload", which also changed server.pve on servers without RealPVE.
+            // "Auto" behaves the same when RealPVE is installed and leaves everything alone when it is not.
+            var olderThan122 = config.Version == null || config.Version == "1.1.0" || config.Version == "1.2.0" || config.Version == "1.2.1";
+            if (olderThan122 && string.Equals(config.RealPveMode, "Unload", StringComparison.OrdinalIgnoreCase))
+            {
+                config.RealPveMode = "Auto";
+                PrintWarning("RealPveMode changed from 'Unload' to 'Auto' (same behaviour with RealPVE; RealPVE is now optional).");
+            }
+
             PrintWarning($"Config migrated from {config.Version ?? "1.1.0"} to {current}. Please review 'RealPveMode' and the chat command lists.");
             config.Version = current;
         }
 
         private void ParseMode()
         {
-            if (!Enum.TryParse(config.RealPveMode, true, out realPveMode) || !Enum.IsDefined(typeof(RealPveMode), realPveMode))
+            if (!Enum.TryParse(config.RealPveMode, true, out configuredMode) || !Enum.IsDefined(typeof(RealPveMode), configuredMode))
             {
-                PrintWarning($"Unknown RealPveMode '{config.RealPveMode}'. Allowed: Unload, Hooks, Off. Using 'Unload'.");
-                realPveMode = RealPveMode.Unload;
+                PrintWarning($"Unknown RealPveMode '{config.RealPveMode}'. Allowed: Auto, Unload, Hooks, Off. Using 'Auto'.");
+                configuredMode = RealPveMode.Auto;
             }
         }
 
@@ -917,6 +992,7 @@ namespace Oxide.Plugins
         private class StoredData
         {
             public bool PermissionsMigrated;
+            public string EffectiveMode; // RealPVE mode the running purge was started with
             public bool IsActive;
             public long EndUtcTicks;
             public string InitiatorId;
