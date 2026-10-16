@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("The Purge", "ThornFox", "1.2.0")]
+    [Info("The Purge", "ThornFox", "1.2.1")]
     [Description("Announces and manages a purge event with UI, optional timer, RealPVE integration (unload or PvP API), Notify support and configurable start/end commands.")]
     public class ThePurge : RustPlugin
     {
@@ -23,10 +23,18 @@ namespace Oxide.Plugins
         private const string RealPveName = "RealPVE";
         private const ulong MinSteamId = 76561197960265728UL;
 
-        // Permission names kept from 1.1.0 so existing grants keep working.
-        private const string PermBegin = "purge.begin";
-        private const string PermEnd = "purge.end";
-        private const string PermInfo = "purge.info";
+        // Permissions use the plugin prefix (since 1.2.1).
+        private const string PermBegin = "thepurge.begin";
+        private const string PermEnd = "thepurge.end";
+        private const string PermInfo = "thepurge.info";
+
+        // Permission names up to 1.2.0. Existing grants are moved to the new names once.
+        private static readonly Dictionary<string, string> LegacyPermissions = new Dictionary<string, string>
+        {
+            ["purge.begin"] = PermBegin,
+            ["purge.end"] = PermEnd,
+            ["purge.info"] = PermInfo
+        };
 
         // Hooks that are only needed while a purge is running.
         private static readonly string[] PurgeHooks = { "OnEntitySpawned", "OnPlayerConnected", "OnPlayerRespawned" };
@@ -73,6 +81,8 @@ namespace Oxide.Plugins
 
         private void OnServerInitialized(bool initial)
         {
+            MigratePermissions();
+
             if (config.UseNotify && Notify == null)
                 PrintWarning("UseNotify is enabled, but the Notify plugin is not loaded.");
 
@@ -855,10 +865,58 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Permission Migration
+
+        // Moves grants of the old purge.* permissions (up to 1.2.0) to thepurge.* and revokes the old ones.
+        // Runs once; the result is stored in the data file.
+        private void MigratePermissions()
+        {
+            if (data.PermissionsMigrated) return;
+
+            int groups = 0, users = 0;
+            foreach (var pair in LegacyPermissions)
+            {
+                try
+                {
+                    foreach (var group in permission.GetPermissionGroups(pair.Key) ?? new string[0])
+                    {
+                        if (string.IsNullOrEmpty(group)) continue;
+                        permission.GrantGroupPermission(group, pair.Value, this);
+                        permission.RevokeGroupPermission(group, pair.Key);
+                        groups++;
+                    }
+
+                    // Entries are returned as "steamId(name)".
+                    foreach (var entry in permission.GetPermissionUsers(pair.Key) ?? new string[0])
+                    {
+                        if (string.IsNullOrEmpty(entry)) continue;
+                        var userId = entry.Split('(')[0].Trim();
+                        if (string.IsNullOrEmpty(userId)) continue;
+                        permission.GrantUserPermission(userId, pair.Value, this);
+                        permission.RevokeUserPermission(userId, pair.Key);
+                        users++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Failed to migrate permission {pair.Key}: {ex.Message}");
+                }
+            }
+
+            if (groups + users > 0)
+                PrintWarning($"Permissions renamed to thepurge.*: moved {groups} group grant(s) and {users} user grant(s) from purge.*.");
+
+            data.PermissionsMigrated = true;
+            SaveData();
+        }
+
+        #endregion
+
         #region Data
 
         private class StoredData
         {
+            public bool PermissionsMigrated;
             public bool IsActive;
             public long EndUtcTicks;
             public string InitiatorId;
